@@ -1,11 +1,15 @@
 import glob
 import getpass
 import inquirer
+import paramiko
+import warnings
 import pandas as pd
 from rich import print
 from src.adapter.mysql import MySQLConnection
 from src.adapter.postgres import PostgreSQLConnection
 from sshtunnel import SSHTunnelForwarder
+
+warnings.filterwarnings("ignore")
 
 class Loader:
     def __init__(self) -> None:
@@ -13,6 +17,7 @@ class Loader:
         self.destination_conn = None
 
     async def run_cli(self) -> None:
+        target_table = ""
         data_source = inquirer.list_input("Choose data sources: ", choices=['Database', 'Files'])
         if data_source.lower() == 'files':
             file_source = inquirer.list_input("Choose file sources: ", choices=['CSV', 'JSON', 'Excel'])
@@ -29,8 +34,8 @@ class Loader:
                 file_source = inquirer.list_input("Choose file sources: ", choices=[ i.split('\\')[1] for i in files ])
                 data = pd.read_excel(f'./files/{file_source}')
 
-            schema = self.get_schema_from_dataframe(data, file_source.split('.')[0])
-            
+            target_table = file_source.split('.')[0]
+            schema = self.get_schema_from_dataframe(data, file_source.split('.')[0])            
 
         elif data_source.lower() == 'database':
             ssh_option = inquirer.list_input("Would you like to use SSH tunnel for your source database?", choices=['Yes.', 'Nope.'])
@@ -59,19 +64,29 @@ class Loader:
                     source_db_credentials['port'] = tunnel.local_bind_port
                     
                     self.source_conn = self.connect_db(source_db_credentials, source_selected_db)
+                    source_pool = await self.source_conn.create_pool()
+
+                    source_table = await self.get_table_names(self.source_conn, source_pool, source_selected_db)
+
+                    selected_source_tables = inquirer.list_input("Choose source database?", choices=source_table)
+                    data = await self.get_data(self.source_conn, source_pool, selected_source_tables)
+
+                    schema = await self.get_schema_from_db(self.source_conn, source_pool, selected_source_tables, source_selected_db)
             else:
                 source_db_credentials, source_selected_db = self.get_db_input("source")
                 self.source_conn = self.connect_db(source_db_credentials, source_selected_db)
 
-            source_pool = await self.source_conn.create_pool()
+                source_pool = await self.source_conn.create_pool()
 
-            source_table = await self.get_table_names(self.source_conn, source_pool, source_selected_db)
+                source_table = await self.get_table_names(self.source_conn, source_pool, source_selected_db)
 
-            selected_source_tables = inquirer.list_input("Choose source database?", choices=source_table)
+                selected_source_tables = inquirer.list_input("Choose source database?", choices=source_table)
 
-            data = await self.get_data(self.source_conn, source_pool, selected_source_tables)
+                data = await self.get_data(self.source_conn, source_pool, selected_source_tables)
 
-            schema = await self.get_schema_from_db(self.source_conn, source_pool, selected_source_tables, source_selected_db)
+                schema = await self.get_schema_from_db(self.source_conn, source_pool, selected_source_tables, source_selected_db)
+
+            target_table = selected_source_tables
 
         ssh_option = inquirer.list_input("Would you like to use SSH tunnel for your destination database?", choices=['Yes.', 'Nope.'])
 
@@ -99,9 +114,16 @@ class Loader:
                 destination_db_credentials['port'] = tunnel.local_bind_port
                 
                 self.destination_conn = self.connect_db(destination_db_credentials, destination_selected_db)
+                destination_pool = await self.destination_conn.create_pool()
+                await self.destination_conn.load_data(destination_pool, schema, data, target_table)
+
         else:
             destination_db_credentials, destination_selected_db = self.get_db_input("destination")
             self.destination_conn = self.connect_db(destination_db_credentials, destination_selected_db)
+            destination_pool = await self.destination_conn.create_pool()
+            await self.destination_conn.load_data(destination_pool, schema, data, target_table)
+
+        print("Data successfully loaded! 👏")
 
     async def get_table_names(self, conn, pool, database: str) -> list:
         query = ""
@@ -167,7 +189,7 @@ class Loader:
             elif str(val) == 'bool':
                 schema[key] = 'boolean'
             else :
-                schema[key] = 'datetime'
+                schema[key] = 'timestamp'
         
         sql = f"CREATE table {tablename} (" + ",".join([f"{cols} {types}" for cols, types in schema.items()]) + ");"
         return sql
@@ -189,7 +211,10 @@ class Loader:
             columns_name, result = await client.get_query(pool, query)
             data = [{columns_name[i] : row[i] for i in range(len(columns_name))} for row in result]
             df = pd.DataFrame(data)
-            schema = ",".join([ f"{row['column_name']} {row['data_type']}" for _, row in df.iterrows() ])
+            df = df.replace('timestamp without time zone', 'timestamp')
+            df = df.replace('character varying', 'varchar(255)')
+            schema = f"CREATE TABLE {table} (" +",".join([ f"{row['column_name']} {row['data_type']}" for _, row in df.iterrows() ]) + ");"
+            return schema
         
 
 def DatabaseLoader() -> Loader:
